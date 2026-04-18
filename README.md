@@ -25,19 +25,26 @@
    npm install
    ```
 
-2. **配置環境變數**
+2. **核心修復補丁（必做！）**
+   Hermes Agent 官方的 `api_server` 存在「記憶壓縮時未回傳新 Session ID」的 Bug，會導致長對話跳躍失憶。請務必執行自動修復腳本來為您的 Hermes 打補丁：
+   ```bash
+   python3 patch_hermes.py
+   ```
+   *執行完畢後，請記得重啟您的 Hermes Gateway 服務。*
+
+3. **配置環境變數**
    複製 `.env.example` 為 `.env`，填入：
    - `CHANNEL_ACCESS_TOKEN` / `CHANNEL_SECRET`
    - `HERMES_API_KEY` (需與大腦端的 `API_SERVER_KEY` 一致)
 
-3. **配置 Hermes Gateway**
+4. **配置 Hermes Gateway**
    在 `~/.hermes/.env` 中確保包含：
    ```bash
    API_SERVER_KEY=your_secret_key
    GATEWAY_ALLOW_ALL_USERS=true
    ```
 
-4. **啟動橋接器**
+5. **啟動橋接器**
    ```bash
    node index.js
    ```

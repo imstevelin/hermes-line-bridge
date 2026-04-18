@@ -27,6 +27,7 @@ const client = new messagingApi.MessagingApiClient({
 // For de-duplication and sequential processing
 const processedMessages = new Set();
 const userQueues = new Map();
+const activeSessions = new Map(); // Tracks the real Hermes Session ID for a user
 
 // Cleanup old message IDs every hour
 setInterval(() => processedMessages.clear(), 3600000);
@@ -134,6 +135,9 @@ async function handleEvent(event) {
     }
 
     // 2. Forward to Hermes
+    const activeSessionId = activeSessions.get(userId) || userId;
+    console.log(`[Session: ${userId}] Forwarding to Hermes (Session-Id: ${activeSessionId})...`);
+
     const response = await axios.post(HERMES_API_URL, {
       model: "hermes-agent",
       messages: [{ role: "user", content: userMessage }],
@@ -142,10 +146,16 @@ async function handleEvent(event) {
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${process.env.HERMES_API_KEY}`,
-        'X-Hermes-Session-Id': userId
+        'X-Hermes-Session-Id': activeSessionId
       },
       timeout: 600000 
     });
+
+    const newSessionId = response.headers['x-hermes-session-id'];
+    if (newSessionId && newSessionId !== activeSessionId) {
+        console.log(`[Session: ${userId}] Context compressed! New Session ID: ${newSessionId}`);
+        activeSessions.set(userId, newSessionId);
+    }
 
     const botResponse = response.data.choices[0].message.content;
 
