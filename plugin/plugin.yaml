@@ -1,0 +1,10 @@
+name: line-platform
+kind: platform
+version: 1.0.0
+description: >
+  LINE Messaging API adapter for Hermes Agent.
+  Supports Reply/Push messages, long-lived typing indicators, and multi-modal inputs.
+author: Steve Lin
+requires_env:
+  - LINE_CHANNEL_ACCESS_TOKEN
+  - LINE_CHANNEL_SECRET

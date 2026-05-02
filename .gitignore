@@ -1,3 +1,22 @@
+# Node
 node_modules/
+npm-debug.log
+
+# Environment
 .env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# Application state
+state.json
+standalone/state.json
+
+# macOS
 .DS_Store
+*.swp
