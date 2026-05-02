@@ -3,6 +3,7 @@ const line = require('@line/bot-sdk');
 const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 require('dotenv').config();
 
 const {
@@ -18,15 +19,17 @@ const config = {
 const app = express();
 const port = process.env.PORT || 5003;
 
-// Hermes API configuration
 const HERMES_API_URL = process.env.HERMES_API_URL || 'http://localhost:8642/v1/chat/completions';
 
-// Initialize LINE client
 const client = new messagingApi.MessagingApiClient({
   channelAccessToken: config.channelAccessToken
 });
 
-// Persistence for Sessions, History, and Pending Responses
+const blobClient = new messagingApi.MessagingApiBlobClient({
+  channelAccessToken: config.channelAccessToken
+});
+
+// Persistence
 const STATE_FILE = path.join(__dirname, 'state.json');
 let state = { sessions: {}, histories: {}, pending_responses: {} };
 
@@ -38,7 +41,6 @@ try {
         histories: savedState.histories || {}, 
         pending_responses: savedState.pending_responses || {} 
     };
-    console.log('[State] Loaded persistent state.');
   }
 } catch (err) {
   console.error('[State] Error loading state:', err.message);
@@ -50,6 +52,12 @@ const saveState = () => {
   } catch (err) {
     console.error('[State] Error saving state:', err.message);
   }
+};
+
+const generateSessionId = () => {
+    const ts = new Date().toISOString().replace(/[-:T.Z]/g, '').slice(0, 14);
+    const rand = crypto.randomBytes(3).toString('hex');
+    return `line_${ts}_${rand}`;
 };
 
 const processedMessages = new Set();
@@ -66,18 +74,44 @@ app.post('/webhook', middleware(config), (req, res) => {
 });
 
 async function enqueueEvent(event) {
-  if (event.type !== 'message' || event.message.type !== 'text') {
-    return;
-  }
+  if (event.type !== 'message') return;
+  const validTypes = ['text', 'location', 'image'];
+  if (!validTypes.includes(event.message.type)) return;
 
   const userId = event.source.userId;
   const messageId = event.message.id;
+  const userMessage = event.message.type === 'text' ? event.message.text.trim() : '';
 
-  if (processedMessages.has(messageId)) {
-    console.log(`[Queue] Duplicate ignored: ${messageId}`);
-    return;
-  }
+  if (processedMessages.has(messageId)) return;
   processedMessages.add(messageId);
+
+  // --- COMMAND HANDLING ---
+  if (event.message.type === 'text') {
+      const lowerMsg = userMessage.toLowerCase();
+      if (lowerMsg === '/help' || lowerMsg === '說明') {
+        const helpText = `🛠️ Hermes LINE Bridge 穩定版：
+        
+1. [/new] 👉 開啟全新會話 (100% 乾淨重置)。
+2. [/help] 👉 顯示此清單。
+
+💡 已修復上下文連貫性問題。現在系統會完整記錄您的對話歷史。`.trim();
+        try {
+            await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: helpText }] });
+        } catch (e) {}
+        return;
+      }
+
+      if (lowerMsg === '/new') {
+        state.sessions[userId] = generateSessionId();
+        state.histories[userId] = [];
+        state.pending_responses[userId] = [];
+        saveState();
+        try {
+            await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: '🧹 對話已重置，已為您準備好全新的會話。' }] });
+        } catch (e) {}
+        return;
+      }
+  }
 
   if (!userQueues.has(userId)) {
     userQueues.set(userId, { queue: [], processing: false });
@@ -91,7 +125,6 @@ async function enqueueEvent(event) {
 async function processQueue(userId) {
   const userState = userQueues.get(userId);
   if (userState.processing) return;
-
   userState.processing = true;
 
   try {
@@ -100,74 +133,92 @@ async function processQueue(userId) {
       try {
         await handleEvent(event);
       } catch (err) {
-        console.error(`[Session: ${userId}] Processing error:`, err.message);
+        console.error(`[Session: ${userId}] Error:`, err.message);
         try {
-          await client.pushMessage({
-            to: userId,
-            messages: [{ type: 'text', text: `⚠️ 系統處理發生錯誤 (Error: ${err.message})。請稍後再試。` }]
-          });
-        } catch (e) {
-          console.error(`[Session: ${userId}] Failed to send error notification:`, e.message);
-        }
+          await client.pushMessage({ to: userId, messages: [{ type: 'text', text: `⚠️ 系統處理錯誤 (${err.message})。` }] });
+        } catch (e) {}
       }
     }
   } finally {
     userState.processing = false;
-    console.log(`[Queue: ${userId}] Queue finished.`);
   }
 }
 
 async function handleEvent(event) {
   const userId = event.source.userId;
-  const userMessage = event.message.text;
   const replyToken = event.replyToken;
+  const messageId = event.message.id;
 
-  console.log(`[Session: ${userId}] Processing: ${userMessage}`);
+  let currentPayload;
+  let logMessage;
 
-  const showLoading = async () => {
-    try {
-        // Use official SDK method
-        await client.showLoadingAnimation({ chatId: userId, loadingSeconds: 40 });
-    } catch (e) {
-        console.error(`[Session: ${userId}] Loading error:`, e.message);
-    }
-  };
+  // 1. Process Input
+  if (event.message.type === 'text') {
+      currentPayload = event.message.text.trim();
+      logMessage = currentPayload;
+  } else if (event.message.type === 'location') {
+      const { title, address, latitude, longitude } = event.message;
+      currentPayload = `[位置資訊] ${title ? title + ' - ' : ''}${address} (緯度: ${latitude}, 經度: ${longitude})`;
+      logMessage = currentPayload;
+  } else if (event.message.type === 'image') {
+      try {
+          const res = await blobClient.getMessageContent(messageId);
+          let buffer;
+          if (res.arrayBuffer) {
+              buffer = Buffer.from(await res.arrayBuffer());
+          } else {
+              const chunks = [];
+              for await (const chunk of res) chunks.push(Buffer.from(chunk));
+              buffer = Buffer.concat(chunks);
+          }
+          currentPayload = [
+              { type: 'text', text: '這是一張圖片，請解析：' },
+              { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${buffer.toString('base64')}` } }
+          ];
+          logMessage = '[收到一張圖片]';
+      } catch (err) {
+          currentPayload = "[圖片讀取失敗]";
+          logMessage = currentPayload;
+      }
+  }
 
-  // 1. Start loading animation
+  console.log(`[Session: ${userId}] Processing: ${logMessage}`);
+
+  // Loading animation loop
+  const showLoading = async () => { try { await client.showLoadingAnimation({ chatId: userId, loadingSeconds: 40 }); } catch (e) {} };
   await showLoading();
-  const loadingTimer = setInterval(showLoading, 30000); // Trigger every 30s to be safe
+  const loadingTimer = setInterval(showLoading, 30000);
 
-  // 2. 10-minute Nudge with Retry logic
+  // Nudge timer
   const nudgeTimer = setTimeout(async () => {
     const sendNudge = async (attempt = 1) => {
         try {
-            console.log(`[Session: ${userId}] 10-minute nudge (attempt ${attempt}).`);
-            await client.pushMessage({
-                to: userId,
-                messages: [{ type: 'text', text: '稍等！系統正在處理複雜任務中，請耐心候標... (進度持續更新中)' }]
-            });
+            await client.pushMessage({ to: userId, messages: [{ type: 'text', text: '稍等！系統正在處理複雜任務中...' }] });
         } catch (e) {
-            if (e.message.includes('429') && attempt < 3) {
-                console.warn(`[Session: ${userId}] Nudge rate limited, retrying in 5s...`);
-                setTimeout(() => sendNudge(attempt + 1), 5000);
-            } else {
-                console.error(`[Session: ${userId}] Nudge failed:`, e.message);
-            }
+            if (e.message.includes('429') && attempt < 3) setTimeout(() => sendNudge(attempt + 1), 5000);
         }
     };
     sendNudge();
   }, 600000);
 
   try {
-    const activeSessionId = state.sessions[userId] || userId;
-    const history = state.histories[userId] || [];
-    const messages = [...history.slice(-10), { role: "user", content: userMessage }];
+    if (!state.sessions[userId]) {
+        state.sessions[userId] = generateSessionId();
+        saveState();
+    }
+    const activeSessionId = state.sessions[userId];
+    
+    // STRATEGY: 
+    // When using X-Hermes-Session-Id, Hermes API Server uses database history.
+    // We only send the CURRENT turn. This prevents the bridge's sliding window
+    // from overriding/corrupting the full database history.
+    const apiMessages = [{ role: "user", content: currentPayload }];
 
-    console.log(`[Session: ${userId}] Forwarding to Hermes...`);
+    console.log(`[Session: ${userId}] Forwarding to Hermes (Session: ${activeSessionId})...`);
 
     const response = await axios.post(HERMES_API_URL, {
       model: "hermes-agent",
-      messages: messages,
+      messages: apiMessages,
       stream: false
     }, {
       headers: {
@@ -175,44 +226,42 @@ async function handleEvent(event) {
         'Authorization': `Bearer ${process.env.HERMES_API_KEY}`,
         'X-Hermes-Session-Id': activeSessionId
       },
-      timeout: 2400000 
+      timeout: 2400000,
+      maxBodyLength: Infinity,
+      maxContentLength: Infinity
     });
 
     clearInterval(loadingTimer);
     clearTimeout(nudgeTimer);
 
-    // CRITICAL: Update and persist Session ID if Hermes triggers compression
     const newSessionId = response.headers['x-hermes-session-id'];
     if (newSessionId && newSessionId !== activeSessionId) {
-        console.log(`[Session: ${userId}] Context compressed! New Session ID: ${newSessionId}`);
+        console.log(`[Session: ${userId}] Session rotated (compression): ${newSessionId}`);
         state.sessions[userId] = newSessionId;
         saveState();
     }
 
     const botResponse = response.data.choices[0].message.content;
 
-    // Update state
+    // We don't need to maintain histories[] for the API call anymore, 
+    // but we keep it for redundancy/local logs if needed.
     if (!state.histories[userId]) state.histories[userId] = [];
-    state.histories[userId].push({ role: "user", content: userMessage });
+    state.histories[userId].push({ role: "user", content: logMessage });
     state.histories[userId].push({ role: "assistant", content: botResponse });
-    if (state.histories[userId].length > 20) state.histories[userId] = state.histories[userId].slice(-20);
+    if (state.histories[userId].length > 40) state.histories[userId] = state.histories[userId].slice(-40);
 
-    // Delivery
     const pending = state.pending_responses[userId] || [];
     const messagesToSend = [...pending, botResponse];
     const lineMessages = messagesToSend.slice(-5).map(text => ({ type: 'text', text }));
 
     try {
         await client.replyMessage({ replyToken, messages: lineMessages });
-        console.log(`[Session: ${userId}] Replied.`);
         state.pending_responses[userId] = [];
     } catch (e) {
-        console.log(`[Session: ${userId}] Reply failed, using Push.`);
         try {
             await client.pushMessage({ to: userId, messages: lineMessages });
             state.pending_responses[userId] = [];
         } catch (pushErr) {
-            console.error(`[Session: ${userId}] Push failed. Queuing.`);
             if (!state.pending_responses[userId]) state.pending_responses[userId] = [];
             state.pending_responses[userId].push(botResponse);
         }
@@ -227,16 +276,11 @@ async function handleEvent(event) {
 }
 
 app.use((err, req, res, next) => {
-  if (err instanceof line.SignatureValidationFailed) {
-    res.status(401).send(err.signature);
-    return;
-  } else if (err instanceof line.JSONParseError) {
-    res.status(400).send(err.raw);
-    return;
-  }
+  if (err instanceof line.SignatureValidationFailed) return res.status(401).send(err.signature);
+  if (err instanceof line.JSONParseError) return res.status(400).send(err.raw);
   next(err);
 });
 
 app.listen(port, () => {
-  console.log(`hermes-line-bridge (Final Stability Version) listening on port ${port}`);
+  console.log(`hermes-line-bridge (Database-First Context) listening on port ${port}`);
 });

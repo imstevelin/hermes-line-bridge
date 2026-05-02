@@ -1,123 +1,89 @@
 import os
 import sys
+import re
+import json
 from pathlib import Path
 import subprocess
 
-def find_api_server_path():
-    # 嘗試預設的源碼安裝路徑
-    default_path = Path.home() / ".hermes" / "hermes-agent" / "gateway" / "platforms" / "api_server.py"
+def find_hermes_path():
+    default_path = Path.home() / ".hermes" / "hermes-agent"
     if default_path.exists():
         return default_path
-        
-    # 嘗試透過 hermes CLI 尋找安裝路徑
     try:
         result = subprocess.run(["hermes", "config", "show"], capture_output=True, text=True)
         for line in result.stdout.splitlines():
             if "Install:" in line:
-                install_dir = line.split("Install:")[1].strip()
-                api_server_path = Path(install_dir) / "gateway" / "platforms" / "api_server.py"
-                if api_server_path.exists():
-                    return api_server_path
-    except Exception:
-        pass
-        
-    print("❌ 無法自動找到 api_server.py，請確認您已正確安裝 Hermes Agent。")
+                return Path(line.split("Install:")[1].strip())
+    except Exception: pass
     return None
 
-def apply_patch(file_path):
-    with open(file_path, 'r', encoding='utf-8') as f:
-        content = f.read()
-
-    # 檢查是否已經打過補丁
-    if "final_session_id" in content and "getattr(agent, \"session_id\", session_id)" in content:
-        print(f"✅ Hermes Agent 已經修復過，無需再次執行補丁：{file_path}")
+def patch_file(path, search_str, replace_str, name):
+    if not path.exists():
+        print(f"⚠️ 跳過 {name}: 找不到檔案")
+        return False
+    content = path.read_text(encoding='utf-8')
+    if replace_str in content:
+        print(f"✅ {name} 已經修復過。")
         return True
+    if search_str in content:
+        path.write_text(content.replace(search_str, replace_str), encoding='utf-8')
+        print(f"🚀 成功套用修復: {name}")
+        return True
+    print(f"❌ 無法修復 {name}: 找不到匹配代碼")
+    return False
 
-    # 補丁 1: 讓 _run 函數回傳更新後的 session_id
-    old_run_return = """            usage = {
-                "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
-                "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
-                "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
-            }
-            return result, usage
+def run_patches():
+    root = find_hermes_path()
+    if not root:
+        print("❌ 找不到 Hermes 安裝路徑")
+        return
 
-        return await loop.run_in_executor(None, _run)"""
-        
-    new_run_return = """            usage = {
-                "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
-                "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
-                "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
-            }
-            return result, usage, getattr(agent, "session_id", session_id)
-
-        return await loop.run_in_executor(None, _run)"""
-
-    if old_run_return in content:
-        content = content.replace(old_run_return, new_run_return)
-
-    # 補丁 2: 讓 _compute_completion 接收並傳遞新的 session_id
-    old_compute = """        idempotency_key = request.headers.get("Idempotency-Key")
-        if idempotency_key:
-            fp = _make_request_fingerprint(body, keys=["model", "messages", "tools", "tool_choice", "stream"])
-            try:
-                result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_completion)
-            except Exception as e:
-                logger.error("Error running agent for chat completions: %s", e, exc_info=True)
-                return web.json_response(
-                    _openai_error(f"Internal server error: {e}", err_type="server_error"),
-                    status=500,
-                )
-        else:
-            try:
-                result, usage = await _compute_completion()
-            except Exception as e:
-                logger.error("Error running agent for chat completions: %s", e, exc_info=True)
-                return web.json_response(
-                    _openai_error(f"Internal server error: {e}", err_type="server_error"),
-                    status=500,
-                )"""
-
-    new_compute = """        idempotency_key = request.headers.get("Idempotency-Key")
-        if idempotency_key:
-            fp = _make_request_fingerprint(body, keys=["model", "messages", "tools", "tool_choice", "stream"])
-            try:
-                result, usage, final_session_id = await _idem_cache.get_or_set(idempotency_key, fp, _compute_completion)
-            except Exception as e:
-                logger.error("Error running agent for chat completions: %s", e, exc_info=True)
-                return web.json_response(
-                    _openai_error(f"Internal server error: {e}", err_type="server_error"),
-                    status=500,
-                )
-        else:
-            try:
-                result, usage, final_session_id = await _compute_completion()
-            except Exception as e:
-                logger.error("Error running agent for chat completions: %s", e, exc_info=True)
-                return web.json_response(
-                    _openai_error(f"Internal server error: {e}", err_type="server_error"),
-                    status=500,
-                )"""
-
-    if old_compute in content:
-        content = content.replace(old_compute, new_compute)
-
-    # 補丁 3: 更新 HTTP Headers 回傳的 Session ID
-    old_return = 'return web.json_response(response_data, headers={"X-Hermes-Session-Id": session_id})'
-    new_return = 'return web.json_response(response_data, headers={"X-Hermes-Session-Id": final_session_id})'
+    # 1. API Server - 413 & Session ID Fix
+    api_server = root / "gateway" / "platforms" / "api_server.py"
+    patch_file(api_server, 'MAX_REQUEST_BYTES = 1_000_000', 'MAX_REQUEST_BYTES = 100_000_000', "API 大檔案支援 (100MB)")
+    patch_file(api_server, 'web.Application(middlewares=mws)', 'web.Application(middlewares=mws, client_max_size=MAX_REQUEST_BYTES)', "AIOHTTP 傳輸限制解除")
     
-    if old_return in content:
-        content = content.replace(old_return, new_return)
+    # 2. Run Agent - Multimodal Save Fix
+    run_agent = root / "run_agent.py"
+    old_save = """                self._session_db.append_message(
+                    session_id=self.session_id,
+                    role=role,
+                    content=content,
+                    tool_name=msg.get("tool_name"),"""
+    new_save = """                # CRITICAL: JSON-serialize multimodal content for DB stability
+                db_content = content
+                if isinstance(content, list):
+                    try:
+                        import json as _json
+                        db_content = _json.dumps(content, ensure_ascii=False)
+                    except Exception: pass
 
-    # 寫入修改
-    with open(file_path, 'w', encoding='utf-8') as f:
-        f.write(content)
-    
-    print(f"✅ 成功修復 Hermes Agent 核心代碼：{file_path}")
-    return True
+                self._session_db.append_message(
+                    session_id=self.session_id,
+                    role=role,
+                    content=db_content,
+                    tool_name=msg.get("tool_name"),"""
+    patch_file(run_agent, old_save, new_save, "多模態訊息存檔修復")
+
+    # 3. Hermes State - Multimodal Load Fix
+    hermes_state = root / "hermes_state.py"
+    old_load = """            msg = {"role": row["role"], "content": content}"""
+    new_load = """            # CRITICAL: Deserialize multimodal content from DB
+            reconstructed_content = content
+            if isinstance(content, str) and content.startswith("[") and content.endswith("]"):
+                try:
+                    import json as _json
+                    parsed = _json.loads(content)
+                    if isinstance(parsed, list): reconstructed_content = parsed
+                except: pass
+            
+            if row["role"] in {"user", "assistant"} and isinstance(reconstructed_content, str):
+                reconstructed_content = sanitize_context(reconstructed_content).strip()
+                
+            msg = {"role": row["role"], "content": reconstructed_content}"""
+    patch_file(hermes_state, old_load, new_load, "多模態訊息讀取還原修復")
 
 if __name__ == "__main__":
-    print("🔍 正在尋找本地的 Hermes Agent 安裝路徑...")
-    target_file = find_api_server_path()
-    if target_file:
-        apply_patch(target_file)
-        print("🚀 修復完成！請記得重新啟動您的 Hermes Gateway 服務。")
+    print("🔍 正在修復 Hermes Agent 核心 Bug...")
+    run_patches()
+    print("\n✨ 所有核心修復已完成！請記得重啟 Hermes Gateway。")
