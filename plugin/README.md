@@ -11,14 +11,20 @@
 
 ## 🛠️ 安裝與啟動
 
-### 1. 安裝插件
+### 1. 核心修復補丁 (重要)
+Hermes Agent 原始碼在處理多模態訊息（圖片）與大型請求時存在數個關鍵 Bug。請執行此腳本以修復後端：
+```bash
+python3 ../patch_hermes.py
+```
+
+### 2. 安裝插件
 將本目錄下的所有檔案（`adapter.py` 與 `plugin.yaml`）拷貝至 Hermes 的插件目錄中：
 ```bash
 mkdir -p ~/.hermes/plugins/line
 cp plugin.yaml adapter.py ~/.hermes/plugins/line/
 ```
 
-### 2. 配置環境變數
+### 3. 配置環境變數
 使用 Hermes 內建的交互式設定指令來配置您的 LINE 帳號：
 ```bash
 hermes gateway setup
@@ -26,7 +32,7 @@ hermes gateway setup
 在選單中選擇 **LINE**，並依照提示輸入您的 `LINE_CHANNEL_ACCESS_TOKEN` 與 `LINE_CHANNEL_SECRET`。
 *(或者您也可以直接修改 `~/.hermes/.env` 加入 `LINE_WEBHOOK_PORT=5003` 等相關參數)*
 
-### 3. 重啟 Gateway
+### 4. 重啟 Gateway
 完成設定後，重新啟動 Gateway 服務讓插件生效：
 ```bash
 hermes gateway restart

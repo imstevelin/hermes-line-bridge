@@ -24,14 +24,14 @@
 1. **取得代碼與安裝依賴**
    ```bash
    git clone https://github.com/imstevelin/hermes-line-bridge
-   cd hermes-line-bridge
+   cd hermes-line-bridge/standalone
    npm install
    ```
 
 2. **核心修復補丁 (重要)**
    Hermes Agent 原始碼在處理多模態訊息（圖片）與大型請求時存在數個關鍵 Bug。**必須執行此腳本**以修復後端，否則 AI 將無法記憶圖片或傳送大檔案：
    ```bash
-   python3 patch_hermes.py
+   python3 ../patch_hermes.py
    ```
 
 3. **配置環境變數**

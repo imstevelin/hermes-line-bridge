@@ -44,6 +44,9 @@ class LineAdapter(BasePlatformAdapter):
         self._runner = None
         self._reply_tokens = {}  # user_id -> replyToken
         self._loading_tasks = {} # user_id -> asyncio.Task
+        self._nudge_tasks = {}   # user_id -> asyncio.Task
+        self._message_buffers = {} # user_id -> list of LINE message objects
+        self._active_turns = set() # user_id
         self._http_session = None
 
     @property
@@ -99,6 +102,9 @@ class LineAdapter(BasePlatformAdapter):
         for task in self._loading_tasks.values():
             task.cancel()
         self._loading_tasks.clear()
+        for task in self._nudge_tasks.values():
+            task.cancel()
+        self._nudge_tasks.clear()
 
     async def _handle_health(self, request):
         return web.json_response({"status": "ok", "platform": "line"})
@@ -140,6 +146,9 @@ class LineAdapter(BasePlatformAdapter):
         reply_token = event.get("replyToken")
         if reply_token:
             self._reply_tokens[user_id] = reply_token
+            # Mark start of a turn to buffer interim messages
+            self._active_turns.add(user_id)
+            self._message_buffers[user_id] = []
             
         message = event.get("message", {})
         msg_type = message.get("type")
@@ -198,6 +207,21 @@ class LineAdapter(BasePlatformAdapter):
                 
         self._loading_tasks[user_id] = asyncio.create_task(loading_loop(user_id))
 
+        # Start 10-minute nudge
+        if user_id in self._nudge_tasks:
+            self._nudge_tasks[user_id].cancel()
+            
+        async def nudge_delay(uid):
+            try:
+                await asyncio.sleep(600)
+                if uid in self._active_turns:
+                    logger.info("LINE: sending 10-minute nudge to %s", uid)
+                    await self._push_fallback(uid, [{"type": "text", "text": "稍等！系統正在處理複雜任務中... (進度持續更新中)"}])
+            except asyncio.CancelledError:
+                pass
+        
+        self._nudge_tasks[user_id] = asyncio.create_task(nudge_delay(user_id))
+
         # Dispatch Message
         if not self._message_handler:
             return
@@ -243,20 +267,21 @@ class LineAdapter(BasePlatformAdapter):
         if not self._http_session:
             return SendResult(success=False, error="Not connected")
             
-        # Cancel loading animation
-        if chat_id in self._loading_tasks:
-            self._loading_tasks[chat_id].cancel()
-            del self._loading_tasks[chat_id]
+        msg = {"type": "text", "text": content}
+        
+        if chat_id in self._active_turns:
+            # Buffer interim message
+            if chat_id not in self._message_buffers:
+                self._message_buffers[chat_id] = []
+            self._message_buffers[chat_id].append(msg)
+            return SendResult(success=True)
 
-        # Check for media attachments from tool use or other platforms
-        media_attachment = metadata.get("attachment") if metadata else None
-        if media_attachment:
-            # Hermes might pass attachments via metadata.
-            # But normally it calls send_image.
-            pass
-
-        messages = [{"type": "text", "text": content}]
-        return await self._send_messages(chat_id, messages)
+        # Final response or direct message
+        buffer = self._message_buffers.pop(chat_id, [])
+        messages = buffer + [msg]
+        
+        # LINE allows max 5 messages per API call
+        return await self._send_messages(chat_id, messages[:5])
         
     async def send_image(
         self,
@@ -269,19 +294,26 @@ class LineAdapter(BasePlatformAdapter):
         if not self._http_session:
             return SendResult(success=False, error="Not connected")
             
-        if chat_id in self._loading_tasks:
-            self._loading_tasks[chat_id].cancel()
-            del self._loading_tasks[chat_id]
-            
-        messages = [{
+        msg = {
             "type": "image",
             "originalContentUrl": image_url,
             "previewImageUrl": image_url
-        }]
+        }
+        
+        if chat_id in self._active_turns:
+            if chat_id not in self._message_buffers:
+                self._message_buffers[chat_id] = []
+            self._message_buffers[chat_id].append(msg)
+            if caption:
+                self._message_buffers[chat_id].append({"type": "text", "text": caption})
+            return SendResult(success=True)
+            
+        buffer = self._message_buffers.pop(chat_id, [])
+        messages = buffer + [msg]
         if caption:
             messages.append({"type": "text", "text": caption})
             
-        return await self._send_messages(chat_id, messages)
+        return await self._send_messages(chat_id, messages[:5])
 
     async def _send_messages(self, user_id: str, messages: list) -> SendResult:
         # Use reply token if available
@@ -333,7 +365,23 @@ class LineAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=str(e))
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
+        # Loading animation is already handled in a loop during the turn
         pass
+
+    async def stop_typing(self, chat_id: str) -> None:
+        # Turn is over, next 'send' call will be the final response
+        if chat_id in self._active_turns:
+            self._active_turns.remove(chat_id)
+            
+        # Cancel loading animation
+        if chat_id in self._loading_tasks:
+            self._loading_tasks[chat_id].cancel()
+            del self._loading_tasks[chat_id]
+
+        # Cancel nudge
+        if chat_id in self._nudge_tasks:
+            self._nudge_tasks[chat_id].cancel()
+            del self._nudge_tasks[chat_id]
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {

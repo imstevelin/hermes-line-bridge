@@ -65,23 +65,23 @@ def run_patches():
                     tool_name=msg.get("tool_name"),"""
     patch_file(run_agent, old_save, new_save, "多模態訊息存檔修復")
 
-    # 3. Hermes State - Multimodal Load Fix
-    hermes_state = root / "hermes_state.py"
-    old_load = """            msg = {"role": row["role"], "content": content}"""
-    new_load = """            # CRITICAL: Deserialize multimodal content from DB
-            reconstructed_content = content
-            if isinstance(content, str) and content.startswith("[") and content.endswith("]"):
-                try:
-                    import json as _json
-                    parsed = _json.loads(content)
-                    if isinstance(parsed, list): reconstructed_content = parsed
-                except: pass
-            
-            if row["role"] in {"user", "assistant"} and isinstance(reconstructed_content, str):
-                reconstructed_content = sanitize_context(reconstructed_content).strip()
-                
-            msg = {"role": row["role"], "content": reconstructed_content}"""
-    patch_file(hermes_state, old_load, new_load, "多模態訊息讀取還原修復")
+    # 4. Auxiliary Client - Base URL Fix
+    aux_client = root / "agent" / "auxiliary_client.py"
+    old_aux = """        base_url = _to_openai_base_url(
+            str(creds.get("base_url", "")).strip().rstrip("/") or pconfig.inference_base_url
+        )"""
+    new_aux = """        raw_base_url = (
+            str(creds.get("base_url", "")).strip().rstrip("/")
+            or pconfig.inference_base_url
+        )
+        # If we explicitly want Anthropic mode, or the URL indicates it,
+        # don't rewrite to /v1 yet. _wrap_if_needed handles it.
+        if (locals().get("api_mode") == "anthropic_messages" or 
+            _endpoint_speaks_anthropic_messages(raw_base_url)):
+            base_url = raw_base_url
+        else:
+            base_url = _to_openai_base_url(raw_base_url)"""
+    patch_file(aux_client, old_aux, new_aux, "輔助客戶端 Base URL 修復")
 
 if __name__ == "__main__":
     print("🔍 正在修復 Hermes Agent 核心 Bug...")
